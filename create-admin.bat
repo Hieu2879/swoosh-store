@@ -1,37 +1,49 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+chcp 65001 >nul
 
-set "SWOOSH_ROOT=%CD%"
-set "SWOOSH_JDBC_URL=jdbc:sqlserver://localhost:1433;databaseName=BeginnerRunningShoesDB;encrypt=true;trustServerCertificate=true;integratedSecurity=true;authenticationScheme=NativeAuthentication"
-set "APP_JAR=%CD%\java-backend\target\swoosh-store-1.0.0.jar"
-set "SQL_AUTH_DIR=%CD%\java-backend\target\native"
+echo ==========================================
+echo  SWOOSH STORE - CREATE LOCAL SQLITE ADMIN
+echo ==========================================
+echo  Username: admin
+echo  Enter a private password (at least 12 characters).
+echo.
 
-where java >nul 2>&1
-if errorlevel 1 (
-    echo Java was not found. Run start-store.bat once, then try again.
+if not exist "store_server.py" (
+    echo ERROR: Missing store_server.py.
     pause
     exit /b 1
 )
+where py >nul 2>&1
+if not errorlevel 1 goto use_py
+where python >nul 2>&1
+if not errorlevel 1 goto use_python
+echo ERROR: Python not found. Install Python 3.10 or newer.
+pause
+exit /b 1
 
-if not exist "%APP_JAR%" (
-    echo The Java application JAR is missing. Run start-store.bat first.
+:use_py
+py -3 store_server.py create-admin --username admin
+set "CREATE_RESULT=%errorlevel%"
+goto check_result
+
+:use_python
+python store_server.py create-admin --username admin
+set "CREATE_RESULT=%errorlevel%"
+goto check_result
+
+:check_result
+if not "%CREATE_RESULT%"=="0" (
+    echo.
+    echo Admin creation failed. Review the error above.
     pause
     exit /b 1
 )
-
-if not exist "%SQL_AUTH_DIR%\mssql-jdbc_auth-12.8.1.x64.dll" (
-    echo SQL Server authentication is not prepared. Run start-store.bat first.
-    pause
-    exit /b 1
-)
-
-java -Djava.library.path="%SQL_AUTH_DIR%" -jar "%APP_JAR%" create-admin
-if errorlevel 1 (
-    echo Admin creation failed. Check the message above and try again.
-    pause
-    exit /b 1
-)
-
-echo You can now sign in at http://127.0.0.1:8081/#login
+echo.
+echo Local admin created. To start the site: python store_server.py
+echo Log in: http://127.0.0.1:8000/#login?role=admin
+echo.
+echo For Render: add SWOOSH_ADMIN_PASSWORD in Render Environment.
+echo Do NOT push the local SQLite database to GitHub.
 pause

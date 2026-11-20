@@ -1,0 +1,21 @@
+# Deploy the Python storefront as a Render web service.
+# Enter SWOOSH_ADMIN_PASSWORD securely in the Render dashboard when prompted.
+services:
+  - type: web
+    name: swoosh-store
+    runtime: python
+    plan: free
+    buildCommand: echo "Python standard library only; nothing to install"
+    startCommand: python store_server.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: SWOOSH_HOST
+        value: 0.0.0.0
+      - key: SWOOSH_COOKIE_SECURE
+        value: "1"
+      - key: TRUST_PROXY
+        value: "1"
+      - key: SWOOSH_ADMIN_USERNAME
+        value: admin
+      - key: SWOOSH_ADMIN_PASSWORD
+        sync: false

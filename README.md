@@ -4,6 +4,8 @@ Trang web thương mại điện tử chuyên cung cấp các mẫu giày thể 
 
 ---
 
+> **Hướng dẫn tạo Admin trên Render theo 3 cách Gemini:** xem [HUONG_DAN_GEMINI_RENDER_ADMIN.md](HUONG_DAN_GEMINI_RENDER_ADMIN.md). Cách được khuyên dùng là `SWOOSH_ADMIN_USERNAME`/`SWOOSH_ADMIN_PASSWORD` trong Render Environment.
+
 ## 🚀 Các Tối Ưu Hóa Đã Thực Hiện Để Đăng Lên Web Công Khai
 
 1. **Tối ưu hiệu năng & dung lượng (Giảm 97% kích thước trang)**:
@@ -76,28 +78,33 @@ Cơ sở dữ liệu được bổ sung bảng/cột tự động khi máy chủ
 
 Dự án đã có sẵn `Dockerfile`, `Procfile` và biến cấu hình chuẩn cho các dịch vụ Cloud:
 
-### Cách triển khai lên Render (Khuyên dùng):
-1. Đưa mã nguồn lên GitHub cá nhân (đảm bảo file `.gitignore` đã chặn file `data/*.sqlite3`).
-2. Đăng nhập vào [Render.com](https://render.com) -> Chọn **New Web Service**.
-3. Kết nối với repo GitHub của bạn.
-4. Render sẽ tự động nhận diện:
-   - **Environment**: Python hoặc Docker
-   - **Build Command**: để trống (không cần build)
-   - **Start Command**: `python store_server.py`
-5. Trong phần **Environment Variables**, thêm:
-   - `SWOOSH_COOKIE_SECURE`: `1`
-   - `TRUST_PROXY`: `1`
-6. Nhấn **Deploy Web Service**. Sau 1-2 phút, bạn sẽ có đường link công khai dạng `https://ten-ung-dung.onrender.com`.
+### Cách triển khai lên Render (Python + tài khoản Admin tự động):
+1. **Giải nén** thư mục dự án và đẩy **các file bên trong** (như `store_server.py`, `index.html`, `render.yaml`) lên GitHub. Không đẩy `data/swoosh.sqlite3` hoặc `.env` lên GitHub vì chứa dữ liệu nhạy cảm.
+2. Vào [Render](https://dashboard.render.com/) → **New → Blueprint**, kết nối kho GitHub có file `render.yaml` ở thư mục gốc.
+3. Khi Render yêu cầu `SWOOSH_ADMIN_PASSWORD`, nhập **mật khẩu riêng tối thiểu 12 ký tự** (không đặt mật khẩu trực tiếp trong mã nguồn hay GitHub).
+4. Render tạo dịch vụ Web với `startCommand: python store_server.py`. Tên tài khoản mặc định là **`admin`** (có thể đổi bằng `SWOOSH_ADMIN_USERNAME` trong Render Environment).
+5. Khi triển khai hoàn tất, mở URL `https://<ten-dich-vu>.onrender.com/#login?role=admin`, chọn **Quản trị viên**, đăng nhập bằng tài khoản `admin` và mật khẩu đã nhập ở bước 3.
+
+Nếu tạo bằng **New → Web Service** thay vì Blueprint, đặt runtime **Python**, Start Command `python store_server.py`, và thêm biến Environment:
+
+| Key | Value |
+|---|---|
+| `SWOOSH_HOST` | `0.0.0.0` |
+| `SWOOSH_COOKIE_SECURE` | `1` |
+| `TRUST_PROXY` | `1` |
+| `SWOOSH_ADMIN_USERNAME` | `admin` |
+| `SWOOSH_ADMIN_PASSWORD` | Mật khẩu riêng (ít nhất 12 ký tự; chỉ đặt trong Render Environment) |
+
+**Tài khoản Admin chỉ được tạo mới khi chưa tồn tại.** Khởi động lại không ghi đè mật khẩu trên database đang có. Nếu đổi biến mật khẩu sau khi Admin đã được tạo, mật khẩu của tài khoản đã có sẽ không tự đổi.
+
+> **Quan trọng với Render Free:** Đây là bản triển khai **demo**. Render Free dùng hệ thống file tạm: dữ liệu SQLite, đơn hàng, tài khoản khách và ảnh mới tải lên có thể bị mất khi dịch vụ ngủ, khởi động lại hoặc deploy lại. Tài khoản Admin vẫn được tạo lại từ biến môi trường, nhưng những dữ liệu phát sinh sẽ không được khôi phục. Để giữ dữ liệu thật, cần chuyển sang cơ sở dữ liệu lưu trữ bền vững hoặc dùng dịch vụ trả phí kèm Persistent Disk, và xử lý cả thư mục ảnh tải lên.
 
 ### Cách triển khai lên Railway:
 1. Đăng nhập [Railway.app](https://railway.app) -> Chọn **New Project** -> **Deploy from GitHub repo**.
 2. Railway tự động đọc `Dockerfile` và deploy trong vòng 60 giây.
 3. Trong tab **Settings** -> **Networking**, nhấn **Generate Domain** để nhận tên miền HTTPS công khai.
 
-> **Lưu ý sau khi deploy**: Để tạo tài khoản admin trên server Cloud, bạn có thể mở Web Terminal / Shell của Render/Railway và chạy:
-> ```bash
-> python store_server.py create-admin --username admin --password "MatKhauCuaBan123!"
-> ```
+> **Lưu ý:** Render Free không có Shell. Hãy thiết lập `SWOOSH_ADMIN_PASSWORD` trong Environment để tạo admin tự động (đã hỗ trợ trong mã nguồn), không cần chạy lệnh thủ công.
 
 ---
 

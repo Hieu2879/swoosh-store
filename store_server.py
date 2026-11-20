@@ -351,6 +351,38 @@ def create_user(username, password, role, profile=None, role_id=None):
             raise ValueError("Tên đăng nhập đã tồn tại.") from exc
 
 
+
+def bootstrap_admin_from_environment():
+    """Create an admin once on a fresh Cloud database; never overwrite existing credentials."""
+    password = os.environ.get("SWOOSH_ADMIN_PASSWORD")
+    username = os.environ.get("SWOOSH_ADMIN_USERNAME", "admin").strip()
+    if password is None:
+        if "SWOOSH_ADMIN_USERNAME" in os.environ:
+            raise SystemExit("Đã đặt SWOOSH_ADMIN_USERNAME nhưng thiếu SWOOSH_ADMIN_PASSWORD.")
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9._-]{3,40}", username):
+        raise SystemExit("SWOOSH_ADMIN_USERNAME không hợp lệ (3-40 ký tự chữ, số, ., _, -).")
+    if not 12 <= len(password) <= 256:
+        raise SystemExit("SWOOSH_ADMIN_PASSWORD phải dài từ 12 đến 256 ký tự.")
+
+    with connect_db() as db:
+        existing = db.execute(
+            "SELECT role, active FROM users WHERE username = ?", (username,)
+        ).fetchone()
+    if existing:
+        if existing["role"] != "admin":
+            raise SystemExit("SWOOSH_ADMIN_USERNAME trùng tài khoản không phải admin.")
+        if not existing["active"]:
+            raise SystemExit("Tài khoản admin từ môi trường đang bị vô hiệu hóa.")
+        return False
+    try:
+        create_user(username, password, "admin")
+    except ValueError as exc:
+        raise SystemExit(f"Không thể tạo admin tự động: {exc}") from exc
+    print(f"Đã khởi tạo tài khoản quản trị '{username}' từ biến môi trường.", flush=True)
+    return True
+
+
 def prompt_admin_passwords(gui=False):
     # 1. Environment variable
     env_pass = os.environ.get("SWOOSH_ADMIN_PASSWORD") or os.environ.get("ADMIN_PASSWORD")
@@ -2160,6 +2192,7 @@ def main():
         print(f"Đã tạo tài khoản Admin '{username}' thành công. Bạn có thể đăng nhập ngay.")
         return
 
+    bootstrap_admin_from_environment()
     server = ThreadingHTTPServer((args.host, args.port), StoreHandler)
     print(f"==================================================")
     print(f"  Swoosh Store đang chạy tại: http://{args.host}:{server.server_port}")
