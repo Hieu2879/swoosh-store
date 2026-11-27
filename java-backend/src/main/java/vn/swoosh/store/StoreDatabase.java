@@ -57,6 +57,26 @@ public final class StoreDatabase {
               CREATE UNIQUE INDEX UX_users_username ON dbo.users(username) WHERE username IS NOT NULL
             """,
             """
+            IF COL_LENGTH('dbo.users','email') IS NULL
+              ALTER TABLE dbo.users ADD email NVARCHAR(255) NULL
+            """,
+            """
+            IF COL_LENGTH('dbo.users','avatar_url') IS NULL
+              ALTER TABLE dbo.users ADD avatar_url NVARCHAR(500) NULL
+            """,
+            """
+            IF COL_LENGTH('dbo.users','google_subject') IS NULL
+              ALTER TABLE dbo.users ADD google_subject VARCHAR(255) NULL
+            """,
+            """
+            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.users') AND name='UX_users_email')
+              CREATE UNIQUE INDEX UX_users_email ON dbo.users(email) WHERE email IS NOT NULL
+            """,
+            """
+            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID('dbo.users') AND name='UX_users_google_subject')
+              CREATE UNIQUE INDEX UX_users_google_subject ON dbo.users(google_subject) WHERE google_subject IS NOT NULL
+            """,
+            """
             IF OBJECT_ID('dbo.staff_profiles','U') IS NULL
             CREATE TABLE dbo.staff_profiles (
               user_id INT NOT NULL PRIMARY KEY REFERENCES dbo.users(user_id) ON DELETE CASCADE,

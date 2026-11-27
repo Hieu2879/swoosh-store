@@ -231,7 +231,7 @@ def init_db():
             """
         )
         user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
-        for column in ("full_name", "address", "citizen_id", "birth_date", "phone_number"):
+        for column in ("full_name", "address", "citizen_id", "birth_date", "phone_number", "email"):
             if column not in user_columns:
                 db.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
         if "role_id" not in user_columns:
@@ -248,7 +248,7 @@ def init_db():
             "INSERT OR IGNORE INTO staff_roles (id, name, permissions) VALUES (1, 'Nhân viên bán hàng', ?)",
             (json.dumps(["orders.read", "orders.update"]),),
         )
-        db.execute("UPDATE users SET role_id=1 WHERE role='staff' AND role_id IS NULL")
+        db.execute("UPDATE users SET role_id=1 WHERE role='staff' AND role_id IS NULL AND COALESCE(phone_number, '')=''")
         db.executemany(
             "INSERT OR IGNORE INTO loyalty_tiers (name, min_points, benefits) VALUES (?, ?, ?)",
             [
@@ -349,6 +349,59 @@ def create_user(username, password, role, profile=None, role_id=None):
             if role == "staff":
                 raise ValueError("Số CCCD đã được sử dụng cho nhân viên khác.") from exc
             raise ValueError("Tên đăng nhập đã tồn tại.") from exc
+
+
+def bootstrap_admin():
+    """Create or synchronize only the explicitly configured administrator."""
+    username = (os.environ.get("SWOOSH_ADMIN_USERNAME") or os.environ.get("ADMIN_USERNAME") or "").strip()
+    password = os.environ.get("SWOOSH_ADMIN_PASSWORD") or os.environ.get("ADMIN_PASSWORD") or ""
+    if not username and not password:
+        return
+    if not re.fullmatch(r"[A-Za-z0-9._-]{3,40}", username) or not 12 <= len(password) <= 256:
+        raise SystemExit("Cấu hình Admin không hợp lệ: cần tên 3–40 và mật khẩu 12–256 ký tự.")
+    with connect_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        existing = db.execute("SELECT id,role,active,password_hash FROM users WHERE username=?", (username,)).fetchone()
+        if existing is None:
+            db.execute(
+                "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,'admin',?)",
+                (username, password_hash(password), datetime.now(timezone.utc).isoformat()),
+            )
+            print("Đã tạo tài khoản Admin từ biến môi trường.")
+        elif existing["role"] != "admin" or not existing["active"]:
+            raise SystemExit("Không thể đồng bộ Admin: tên trùng tài khoản không phải Admin hoặc đã bị khóa.")
+        elif not password_matches(password, existing["password_hash"]):
+            db.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash(password), existing["id"]))
+            db.execute("DELETE FROM sessions WHERE user_id=?", (existing["id"],))
+            print("Đã đồng bộ mật khẩu Admin từ biến môi trường.")
+        else:
+            print("Tài khoản Admin từ biến môi trường đã sẵn sàng.")
+
+
+def customer_profile(db, user_id):
+    row = db.execute(
+        "SELECT id AS user_id,username,full_name,phone_number,email,created_at FROM users WHERE id=?",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        raise APIError(404, "Không tìm thấy tài khoản.")
+    item = dict(row)
+    item["email"] = item["email"] or ""
+    item["phone_number"] = item["phone_number"] or ""
+    item["avatar_url"] = None
+    return item
+
+
+def validate_shipping_address(data):
+    fields = ("recipientName", "phone", "province", "district", "ward", "detail")
+    if any(not isinstance(data.get(key), str) for key in fields):
+        raise APIError(400, "Thông tin địa chỉ giao hàng không hợp lệ.")
+    name, phone, province, district, ward, detail = (data[key].strip() for key in fields)
+    if (not 2 <= len(name) <= 100 or not re.fullmatch(r"[0-9]{9,12}", phone)
+            or any(not 1 <= len(value) <= 100 for value in (province, district, ward))
+            or not 5 <= len(detail) <= 255):
+        raise APIError(400, "Thông tin địa chỉ giao hàng không hợp lệ.")
+    return name, phone, province, district, ward, detail
 
 
 def prompt_admin_passwords(gui=False):
@@ -601,7 +654,12 @@ class StoreHandler(SimpleHTTPRequestHandler):
             return None
         if row["user_id"] and not row["active"]:
             return None
-        return row
+        # Older SQLite databases represent customers as staff with a phone number.
+        # Normalize the role before any permission checks, not just in the UI.
+        result = dict(row)
+        if result["role"] == "staff" and result["phone_number"]:
+            result["role"] = "customer"
+        return result
 
     def make_session(self, user_id=None):
         token = secrets.token_urlsafe(32)
@@ -648,7 +706,8 @@ class StoreHandler(SimpleHTTPRequestHandler):
         return session
 
     def session_user(self, session):
-        if session["role"] == "staff" and session.get("phone_number"):
+        session = dict(session)
+        if session["role"] == "customer" or (session["role"] == "staff" and session.get("phone_number")):
             return {
                 "username": session.get("full_name") or session["username"],
                 "fullName": session.get("full_name") or "",
@@ -656,9 +715,6 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 "role": "customer",
             }
         user = {"username": session["username"], "role": session["role"]}
-        if session["role"] == "customer":
-            user["phone"] = session.get("phone_number", "")
-            user["fullName"] = session.get("full_name", "")
         if session["role"] == "staff":
             with connect_db() as db:
                 row = db.execute(
@@ -778,23 +834,13 @@ class StoreHandler(SimpleHTTPRequestHandler):
                 self.send_json(200, {"articles": [dict(row) for row in rows]})
                 return
             if path == "/api/customer/profile":
-                session = self.require_role("customer", "staff")
+                session = self.require_role("customer")
                 with connect_db() as db:
-                    row = db.execute(
-                        "SELECT id AS user_id, username, full_name, phone_number, created_at "
-                        "FROM users WHERE id=?",
-                        (session["user_id"],),
-                    ).fetchone()
-                if not row:
-                    raise APIError(404, "Không tìm thấy tài khoản.")
-                item = dict(row)
-                item["email"] = ""
-                item["avatar_url"] = None
-                item["phone_number"] = item["phone_number"] or ""
+                    item = customer_profile(db, session["user_id"])
                 self.send_json(200, item)
                 return
             if path == "/api/customer/addresses":
-                session = self.require_role("customer", "staff")
+                session = self.require_role("customer")
                 with connect_db() as db:
                     rows = db.execute(
                         """SELECT address_id AS id, recipient_name, phone, province, district,
@@ -1185,12 +1231,15 @@ class StoreHandler(SimpleHTTPRequestHandler):
                         if not re.fullmatch(r"[0-9]{9,12}", phone):
                             raise APIError(400, "Số điện thoại phải có từ 9 đến 12 chữ số.")
                         user = db.execute(
-                            "SELECT * FROM users WHERE phone_number = ? AND role = 'staff'",
+                            "SELECT * FROM users WHERE phone_number = ? AND role IN ('staff','customer')",
                             (phone,),
                         ).fetchone()
                     else:
                         user = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-                    valid = bool(user and user["active"] and password_matches(password, user["password_hash"]))
+                    actual_role = ("customer" if user and user["role"] == "staff" and user["phone_number"]
+                                   else user["role"] if user else None)
+                    valid = bool(user and user["active"] and (not role or role == actual_role)
+                                 and password_matches(password, user["password_hash"]))
                 if not valid:
                     with connect_db() as db:
                         actor = phone or username or "Không rõ"
@@ -1321,6 +1370,39 @@ class StoreHandler(SimpleHTTPRequestHandler):
                     )
                     record_activity(db, session["username"], "Đăng bài blog", "blog", cursor.lastrowid, self.client_ip())
                 self.send_json(201, {"articleId": cursor.lastrowid, "slug": slug})
+                return
+            if path == "/api/customer/addresses":
+                session = self.require_role("customer")
+                self.require_csrf(session)
+                address = validate_shipping_address(data)
+                make_default = data.get("isDefault", False)
+                if not isinstance(make_default, bool):
+                    raise APIError(400, "Trạng thái địa chỉ mặc định không hợp lệ.")
+                with connect_db() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    if make_default:
+                        db.execute("UPDATE shipping_addresses SET is_default=0 WHERE user_id=?", (session["user_id"],))
+                    cursor = db.execute(
+                        """INSERT INTO shipping_addresses(user_id,recipient_name,phone,province,district,ward,detailed_address,is_default)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (session["user_id"], *address, int(make_default)),
+                    )
+                    address_id = cursor.lastrowid
+                    record_activity(db, session["username"], "Thêm địa chỉ giao hàng", "shipping_address", address_id, self.client_ip())
+                self.send_json(201, {"id": address_id, "ok": True})
+                return
+            address_default = re.fullmatch(r"/api/customer/addresses/([0-9]{1,18})/default", path)
+            if address_default:
+                session = self.require_role("customer")
+                self.require_csrf(session)
+                address_id = int(address_default.group(1))
+                with connect_db() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    if not db.execute("SELECT 1 FROM shipping_addresses WHERE address_id=? AND user_id=?", (address_id, session["user_id"])).fetchone():
+                        raise APIError(404, "Không tìm thấy địa chỉ giao hàng.")
+                    db.execute("UPDATE shipping_addresses SET is_default=0 WHERE user_id=?", (session["user_id"],))
+                    db.execute("UPDATE shipping_addresses SET is_default=1 WHERE address_id=? AND user_id=?", (address_id, session["user_id"]))
+                self.send_json(200, {"ok": True})
                 return
             if path == "/api/customer/wishlist":
                 session = self.require_role("customer", "staff")
@@ -1614,6 +1696,45 @@ class StoreHandler(SimpleHTTPRequestHandler):
         path = unquote(urlsplit(self.path).path)
         try:
             data = self.read_json()
+            if path == "/api/customer/profile":
+                session = self.require_role("customer")
+                self.require_csrf(session)
+                if any(not isinstance(data.get(key), str) for key in ("fullName", "email", "phone")):
+                    raise APIError(400, "Thông tin cá nhân không hợp lệ.")
+                name, email, phone = (data[key].strip() for key in ("fullName", "email", "phone"))
+                if not 2 <= len(name) <= 100:
+                    raise APIError(400, "Vui lòng nhập họ tên hợp lệ.")
+                if email and (len(email) > 255 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email)):
+                    raise APIError(400, "Địa chỉ email không hợp lệ.")
+                if not re.fullmatch(r"[0-9]{9,12}", phone):
+                    raise APIError(400, "Số điện thoại phải có từ 9 đến 12 chữ số.")
+                with connect_db() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    uid = session["user_id"]
+                    if db.execute("SELECT 1 FROM users WHERE id<>? AND (phone_number=? OR username=? COLLATE NOCASE OR (?<>'' AND email=? COLLATE NOCASE))", (uid, phone, phone, email, email)).fetchone():
+                        raise APIError(409, "Email hoặc số điện thoại đã được sử dụng.")
+                    try:
+                        db.execute("UPDATE users SET full_name=?,email=?,phone_number=?,username=? WHERE id=?", (name, email or None, phone, phone, uid))
+                    except sqlite3.IntegrityError as exc:
+                        raise APIError(409, "Email hoặc số điện thoại đã được sử dụng.") from exc
+                    record_activity(db, name, "Cập nhật thông tin cá nhân", "customer", uid, self.client_ip())
+                    updated = customer_profile(db, uid)
+                self.send_json(200, updated)
+                return
+            address_match = re.fullmatch(r"/api/customer/addresses/([0-9]{1,18})", path)
+            if address_match:
+                session = self.require_role("customer")
+                self.require_csrf(session)
+                address = validate_shipping_address(data)
+                with connect_db() as db:
+                    cursor = db.execute(
+                        """UPDATE shipping_addresses SET recipient_name=?,phone=?,province=?,district=?,ward=?,detailed_address=?
+                           WHERE address_id=? AND user_id=?""", (*address, int(address_match.group(1)), session["user_id"]),
+                    )
+                    if not cursor.rowcount:
+                        raise APIError(404, "Không tìm thấy địa chỉ giao hàng.")
+                self.send_json(200, {"ok": True})
+                return
             if path.startswith("/api/admin/blog/"):
                 session = self.require_role("admin")
                 self.require_csrf(session)
@@ -1895,6 +2016,16 @@ class StoreHandler(SimpleHTTPRequestHandler):
     def do_DELETE(self):
         path = unquote(urlsplit(self.path).path)
         try:
+            address_match = re.fullmatch(r"/api/customer/addresses/([0-9]{1,18})", path)
+            if address_match:
+                session = self.require_role("customer")
+                self.require_csrf(session)
+                with connect_db() as db:
+                    cursor = db.execute("DELETE FROM shipping_addresses WHERE address_id=? AND user_id=?", (int(address_match.group(1)), session["user_id"]))
+                    if not cursor.rowcount:
+                        raise APIError(404, "Không tìm thấy địa chỉ giao hàng.")
+                self.send_json(200, {"ok": True})
+                return
             if path.startswith("/api/customer/wishlist/"):
                 session = self.require_role("customer", "staff")
                 self.require_csrf(session)
@@ -2160,6 +2291,7 @@ def main():
         print(f"Đã tạo tài khoản Admin '{username}' thành công. Bạn có thể đăng nhập ngay.")
         return
 
+    bootstrap_admin()
     server = ThreadingHTTPServer((args.host, args.port), StoreHandler)
     print(f"==================================================")
     print(f"  Swoosh Store đang chạy tại: http://{args.host}:{server.server_port}")

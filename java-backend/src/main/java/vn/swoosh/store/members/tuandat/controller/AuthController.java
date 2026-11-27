@@ -2,15 +2,24 @@ package vn.swoosh.store.members.tuandat.controller;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import vn.swoosh.store.CredentialService;
 import vn.swoosh.store.SecurityService;
 import vn.swoosh.store.StoreDatabase;
 import vn.swoosh.store.StoreSupport;
+import vn.swoosh.store.StoreApplication;
 import org.springframework.http.CacheControl;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -27,14 +36,19 @@ public class AuthController {
     private final SecurityService security;
     private final CredentialService credentials;
     private final StoreDatabase storeDatabase;
+    private final StoreApplication.StoreProperties properties;
+    private final ObjectMapper objectMapper;
     private final Map<String, List<Long>> loginAttempts = new ConcurrentHashMap<>();
 
     public AuthController(JdbcTemplate db, SecurityService security, CredentialService credentials,
-                          StoreDatabase storeDatabase) {
+                          StoreDatabase storeDatabase, StoreApplication.StoreProperties properties,
+                          ObjectMapper objectMapper) {
         this.db = db;
         this.security = security;
         this.credentials = credentials;
         this.storeDatabase = storeDatabase;
+        this.properties = properties;
+        this.objectMapper = objectMapper;
     }
 
     @GetMapping("/health")
@@ -117,6 +131,134 @@ public class AuthController {
         Map<String, Object> created = security.createSession(StoreSupport.number(user.get("user_id")), request, response).getBody();
         security.recordActivity(username, "Đăng nhập", "auth", "", request);
         loginAttempts.remove(ip);
+        Map<String, Object> body = new HashMap<>(created);
+        body.put("user", security.sessionUser(user));
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(body);
+    }
+
+    @GetMapping("/google/config")
+    Map<String, Object> googleConfig() {
+        String clientId = StoreSupport.text(properties.googleClientId()).trim();
+        return Map.of("clientId", clientId, "enabled", !clientId.isBlank());
+    }
+
+    @PostMapping("/google/login")
+    ResponseEntity<Map<String, Object>> googleLogin(@RequestBody Map<String, Object> data,
+                                                     HttpServletRequest request,
+                                                     HttpServletResponse response) {
+        Map<String, Object> guest = security.currentSession(request);
+        if (guest == null) StoreSupport.fail(403, "Phiên đăng nhập hết hạn. Hãy tải lại trang.");
+        security.requireCsrf(guest, request);
+
+        String clientId = StoreSupport.text(properties.googleClientId()).trim();
+        if (clientId.isBlank()) StoreSupport.fail(503, "Đăng nhập Google chưa được cấu hình.");
+        String credential = StoreSupport.text(data.get("credential")).trim();
+        if (credential.isBlank()) StoreSupport.fail(400, "Thiếu thông tin đăng nhập Google.");
+
+        Map<String, Object> tokenInfo;
+        try {
+            String encodedCredential = URLEncoder.encode(credential, StandardCharsets.UTF_8);
+            HttpRequest googleRequest = HttpRequest.newBuilder()
+                .uri(URI.create("https://oauth2.googleapis.com/tokeninfo?id_token=" + encodedCredential))
+                .GET()
+                .build();
+            HttpResponse<String> googleResponse = HttpClient.newHttpClient().send(
+                googleRequest, HttpResponse.BodyHandlers.ofString());
+            if (googleResponse.statusCode() != 200) {
+                StoreSupport.fail(401, "Thông tin đăng nhập Google không hợp lệ.");
+            }
+            tokenInfo = objectMapper.readValue(googleResponse.body(),
+                new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {});
+        } catch (vn.swoosh.store.ApiException error) {
+            throw error;
+        } catch (Exception error) {
+            StoreSupport.fail(401, "Không thể xác minh đăng nhập Google.");
+            return null;
+        }
+
+        if (!clientId.equals(StoreSupport.text(tokenInfo.get("aud")))) {
+            StoreSupport.fail(401, "Thông tin Google không thuộc ứng dụng này.");
+        }
+        String issuer = StoreSupport.text(tokenInfo.get("iss"));
+        if (!"accounts.google.com".equals(issuer) && !"https://accounts.google.com".equals(issuer)) {
+            StoreSupport.fail(401, "Nhà phát hành đăng nhập Google không hợp lệ.");
+        }
+        if (!"true".equalsIgnoreCase(StoreSupport.text(tokenInfo.get("email_verified")))) {
+            StoreSupport.fail(401, "Tài khoản Google chưa xác minh email.");
+        }
+
+        String email = StoreSupport.text(tokenInfo.get("email")).trim().toLowerCase();
+        String subject = StoreSupport.text(tokenInfo.get("sub")).trim();
+        String name = StoreSupport.text(tokenInfo.get("name")).trim();
+        String picture = StoreSupport.text(tokenInfo.get("picture")).trim();
+        if (email.isBlank() || subject.isBlank()) {
+            StoreSupport.fail(400, "Google không cung cấp đủ thông tin tài khoản.");
+        }
+        if (name.isBlank()) name = email.contains("@") ? email.substring(0, email.indexOf('@')) : email;
+
+        Long userId;
+        List<Map<String, Object>> users = db.queryForList(
+            "SELECT user_id,status FROM users WHERE email=? OR google_subject=?", email, subject);
+        if (users.isEmpty()) {
+            try {
+                userId = db.queryForObject("""
+                    INSERT INTO users(email,password_hash,full_name,avatar_url,google_subject,status,created_at,updated_at)
+                    OUTPUT INSERTED.user_id
+                    VALUES(?,?,?,?,?,'ACTIVE',SYSUTCDATETIME(),SYSUTCDATETIME())
+                    """, Long.class, email, credentials.hash(UUID.randomUUID().toString()),
+                    name, picture.isBlank() ? null : picture, subject);
+                db.update("""
+                    INSERT INTO user_roles(user_id,role_id,assigned_at)
+                    SELECT ?,role_id,SYSUTCDATETIME() FROM roles WHERE role_code='CUSTOMER'
+                    """, userId);
+                db.update("""
+                    IF NOT EXISTS (SELECT 1 FROM loyalty_accounts WHERE user_id=?)
+                        INSERT INTO loyalty_accounts(user_id,points,created_at)
+                        VALUES(?,0,SYSUTCDATETIME())
+                    """, userId, userId);
+            } catch (org.springframework.dao.DataIntegrityViolationException error) {
+                users = db.queryForList(
+                    "SELECT user_id,status FROM users WHERE email=? OR google_subject=?", email, subject);
+                if (users.isEmpty()) {
+                    StoreSupport.fail(409, "Không thể tạo tài khoản Google.");
+                    return null;
+                }
+                userId = StoreSupport.number(users.get(0).get("user_id"));
+            }
+        } else {
+            userId = StoreSupport.number(users.get(0).get("user_id"));
+            db.update("""
+                UPDATE users SET email=?,google_subject=?,avatar_url=?,
+                                 updated_at=SYSUTCDATETIME()
+                WHERE user_id=? AND status='ACTIVE'
+                """, email, subject, picture.isBlank() ? null : picture, userId);
+        }
+
+        String loginSql = """
+            SELECT users.*,
+                   CASE WHEN users.status='ACTIVE' THEN 1 ELSE 0 END AS active,
+                   CASE WHEN roles.role_code='ADMIN' THEN 'admin'
+                        WHEN roles.role_code='CUSTOMER' THEN 'customer'
+                        WHEN roles.role_id IS NOT NULL THEN 'staff' END AS role,
+                   roles.role_id
+            FROM users
+            OUTER APPLY (
+              SELECT TOP (1) role.role_id,role.role_code
+              FROM user_roles user_role JOIN roles role ON role.role_id=user_role.role_id
+              WHERE user_role.user_id=users.user_id
+              ORDER BY CASE WHEN role.role_code='ADMIN' THEN 0 ELSE 1 END,role.role_id
+            ) roles
+            WHERE users.user_id=?
+            """;
+        Map<String, Object> user = db.queryForMap(loginSql, userId);
+        if (StoreSupport.number(user.get("active")) == 0
+                || !"customer".equals(user.get("role"))) {
+            StoreSupport.fail(401, "Tài khoản Google không phải tài khoản khách hàng.");
+        }
+
+        db.update("DELETE FROM app_sessions WHERE token_hash=?", guest.get("token_hash"));
+        Map<String, Object> created = security.createSession(userId, request, response).getBody();
+        security.recordActivity(name, "Đăng nhập bằng Google", "auth", email, request);
         Map<String, Object> body = new HashMap<>(created);
         body.put("user", security.sessionUser(user));
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(body);
