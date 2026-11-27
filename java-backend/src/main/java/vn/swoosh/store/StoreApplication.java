@@ -115,6 +115,7 @@ public class StoreApplication {
     }
 
     @ConfigurationProperties(prefix = "swoosh")
-    public record StoreProperties(Path root, String jdbcUrl, boolean cookieSecure, boolean trustProxy) {
+    public record StoreProperties(Path root, String jdbcUrl, boolean cookieSecure, boolean trustProxy,
+                                  String googleClientId) {
     }
 }
